@@ -1,0 +1,382 @@
+#!/usr/bin/env python
+
+#################################################################################
+#  Copy each file listed in a playlist to some destination directory (a USB
+#  device perhaps.)  The files will be converted to MP3 format, normalized,
+#  and leading or trailing silence will be removed.
+#################################################################################
+#  Copyright (C) 2021  David King <dave@daveking.com>
+#
+#  This Source Code Form is subject to the terms of the Mozilla Public License,
+#  v. 2.0.  If a copy of the MPL was not distbuted with this file, You can
+#  obtain one at https://mozilla.org/MPL/2.0/.
+#################################################################################
+
+import json
+from optparse import OptionParser
+import os
+import subprocess
+
+#  Get the percentage difference between the durations of two audio files
+def compare_files(source, target):
+	
+	def getDuration(filename):
+		cmdline = 'ffprobe -v quiet -hide_banner -show_streams -print_format json "{}"'.format(filename)
+		try:
+			proc = subprocess.run(cmdline, shell=True, check=True, capture_output=True)
+		except subprocess.CalledProcessError as e:
+			print('ERROR: {}'.format(e))
+			if e.stdout:
+				print('STDOUT: {}', e.stdout)
+			if e.stderr:
+				print('STDERR: {}', e.stderr)
+			return False
+		for stream in json.loads(proc.stdout)['streams']:
+			if stream['codec_type'] == 'audio':
+				return float(stream['duration'])
+		print('Unable to get duration for {}'.format(filename))
+		return 0
+
+	source_duration = getDuration(source)
+	target_duration = getDuration(target)
+	if source_duration == 0 or target_duration == 0:
+		return 100
+	else:
+		return abs((source_duration - target_duration) / source_duration) * 100	
+	
+def copy_file(source_fn, target_fn):
+	#  Make sure that target path exists
+	try:
+		os.makedirs(os.path.split(target_fn)[0], exist_ok=True)
+	except Exception as e:
+		print('ERROR: Unable to create directory "{}": {}'.format(os.path.split(target_fn)[0], e))
+		return
+	
+	#  Encode audio in MP3, normalize and remove silence at beginning and end
+	done = False
+	for db in range(-40, -91, -10):
+		cmdline = 'ffmpeg -hide_banner -y -i "{}" -ar 44100 -b:a 192k -af "dynaudnorm,silenceremove=1:0:{}dB:1:0.5:{}dB:1" -strict -2 "{}"'.format(fn, db, db, target_fn)
+		try:
+			proc = subprocess.run(cmdline, shell=True, check=True, capture_output=True)
+		except subprocess.CalledProcessError as e:
+			print('ERROR: {}'.format(e))
+			if e.stdout:
+				print('STDOUT: {}', e.stdout)
+			if e.stderr:
+				print('STDERR: {}', e.stderr)
+			return False
+			
+		#  Check that the play times of the source and target files are 
+		#  within 5% of each other
+		if compare_files(fn, target_fn) <= 5:	
+			done = True
+			break
+			
+	#  If output file is too different in size, re-encode it without removing silence
+	if not done:
+		cmdline = 'ffmpeg -hide_banner -y -i "{}" -ar 44100 -b:a 192k -af "dynaudnorm" -vn -strict -2 "{}"'.format(fn, target_fn)
+		try:
+			proc = subprocess.run(cmdline, shell=True, check=True, capture_output=True)
+		except subprocess.CalledProcessError as e:
+			print('ERROR: {}'.format(e))
+			if e.stdout:
+				print('STDOUT: {}', e.stdout)
+			if e.stderr:
+				print('STDERR: {}', e.stderr)
+			return False
+
+		#  Check that the play times of the source and target files are 
+		#  within 5% of each other
+		if compare_files(fn, target_fn) > 5:	
+			print('ERROR: durations of source are target files more than 5%')
+			return
+
+	return
+	
+description = 'Copy each file listed in a playlist to some destination directory (a USB device perhaps.)  The files will be converted to MP3 format, normalized, and leading or trailing silence will be removed.'
+usage="usage: \033[00;01m%prog\033[00m PLAYLIST_FILENAME DESTINATION_PATH"
+parser = OptionParser(usage=usage, description=description)
+(opts, args) = parser.parse_args()
+if len(args) == 2:
+	playlist_file = args[0]
+	target_dir = args[1]
+	if not os.path.isfile(playlist_file):
+		parser.error(playlist_file + ' file does not exist')
+	if not os.path.isdir(target_dir):
+		parser.error(target_dir + ' directory does not exist')
+else:
+	parser.error('Please specify the fully qualitied name of a playlist file and a destination directory for the output MP3 files.')
+	
+with open(playlist_file, 'r') as playlist:
+	for filename in playlist:
+		fn = filename.strip()
+		if not fn.startswith('#'):
+			#  Default name for target file
+			mp3_fn = os.path.splitext(fn)[0] + '.mp3'
+			target_fn = os.path.join(target_dir, mp3_fn.strip('/'))
+
+			#  Path mangling for playlists from my music library
+			if fn.startswith('/storage/music'):
+				fn = fn.replace('/storage/', '/mnt/', 1)
+				mp3_fn = mp3_fn.replace('/storage/music', '', 1)
+				target_fn = os.path.join(target_dir, mp3_fn.strip('/'))
+				
+			#  Copy the file if it doesn't already exist on the target
+			if not os.path.isfile(target_fn):
+				print('{} -> {}'.format(fn, target_fn))
+				copy_file(fn, target_fn)
+			else:
+				print('{} already exists'.format(target_fn))
+			
+'''
+
+from optparse import OptionParser
+import os, sys, syslog 
+import shutil
+import shlex, subprocess
+import tempfile
+import json
+import base64
+import cgi
+
+def notify(summary, body):
+	print("{}: {}".format(summary, body))
+#	icon = '/usr/share/icons/gnome/32x32/mimetypes/audio-x-generic.png'
+#	args = shlex.split('notify-send -i {} "{}" "{}"'.format(icon, cgi.escape(summary), cgi.escape(body)))
+#	returncode = subprocess.call(args)
+
+def safeText(s):
+	s = s.replace('/', '~').replace('?', '~').replace("'", "~").replace('"', '~')
+	return s.strip()
+	
+def getMeta(fn):
+	artist = album = track = title = genre = img_file = ''
+	(dummy, ext) = os.path.splitext(fn)
+	if ext.lower() == '.flac':
+		img_file = tempfile.mktemp()
+		args = shlex.split('metaflac --export-tags-to=- --export-picture-to={} "{}"'.format(img_file, fn))
+		process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		results = process.communicate()
+		if process.returncode == 0:
+			for line in results[0].split('\n'):
+				words = line.split('=')
+				if words[0] == 'TITLE':
+					title = safeText(words[1])
+				elif words[0] == 'ARTIST':
+					artist = safeText(words[1])
+				elif words[0] == 'ALBUM':
+					album = safeText(words[1])
+				elif words[0] == 'TRACKNUMBER':
+					track = safeText(words[1])
+				elif words[0] == 'GENRE':
+					genre = safeText(words[1])
+		elif process.returncode == 1 and 'FLAC file has no PICTURE block' in results[1]:
+			notify('No Cover Art', 'No cover art in {}'.format(fn))
+			try:
+				os.unlink(img_file)
+			except:
+				pass
+			img_file = ''
+			for line in results[0].split('\n'):
+				words = line.split('=')
+				if words[0] == 'TITLE':
+					title = safeText(words[1])
+				elif words[0] == 'ARTIST':
+					artist = safeText(words[1])
+				elif words[0] == 'ALBUM':
+					album = safeText(words[1])
+				elif words[0] == 'TRACKNUMBER':
+					track = safeText(words[1])
+				elif words[0] == 'GENRE':
+					genre = safeText(words[1])
+		else:
+			notify('getMeta Failed', 'metaflac command failed for {}'.format(fn))
+			for line in results[1].split('\n'):
+				syslog.syslog(line)
+				print line
+			try:
+				os.unlink(img_file)
+			except:
+				pass
+	elif ext.lower() == '.mp3':
+		img_file = tempfile.mktemp()
+		args = shlex.split('id3info "{}"'.format(fn))
+		process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		results = process.communicate()
+		if process.returncode == 0:
+			for line in results[0].split('\n'):
+				words = line.split(':')
+				if '=== TIT2' in line:
+					title = safeText(words[1])
+				elif '=== TPE1' in line:
+					artist = safeText(words[1])
+				elif '=== TALB' in line:
+					album = safeText(words[1])
+				elif '=== TRCK' in line:
+					track = safeText(words[1])
+	
+			args = shlex.split('ffmpeg -y -i "{}" -map 0:1 -f mjpeg "{}"'.format(fn, img_file))
+			process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+			results = process.communicate()
+			if process.returncode != 0:
+				notify('No Cover Art', 'ffmpeg command failed to fetch cover art from {}'.format(fn))
+				for line in results[1].split('\n'):
+					syslog.syslog(line)
+					print line
+					img_file = ''
+				try:
+					os.unlink(img_file)
+				except:
+					pass
+		else:
+			notify('getMeta Failed', 'ffprobe command failed for {}'.format(fn))
+			for line in results[1].split('\n'):
+				print line
+	elif ext.lower() == '.ogg':
+		args = shlex.split('ffprobe -print_format json -show_streams "{}"'.format(fn))
+		process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		results = process.communicate()
+		if process.returncode == 0:
+			metadata = json.loads(results[0])
+			if 'TITLE' in metadata['streams'][0]['tags']:
+				title = safeText(metadata['streams'][0]['tags']['TITLE'])
+			if 'ARTIST' in metadata['streams'][0]['tags']:
+				artist = safeText(metadata['streams'][0]['tags']['ARTIST'])
+			if 'ALBUM' in metadata['streams'][0]['tags']:
+				album = safeText(metadata['streams'][0]['tags']['ALBUM'])
+			if 'TRACK' in metadata['streams'][0]['tags']:
+				track = safeText(metadata['streams'][0]['tags']['track'])
+			if 'GENRE' in metadata['streams'][0]['tags']:
+				genre = safeText(metadata['streams'][0]['tags']['GENRE'])
+			if 'COVERART' in metadata['streams'][0]['tags']:
+				coverart = metadata['streams'][0]['tags']['COVERART']
+				img_file = tempfile.mktemp()
+				with open(img_file, 'w') as f:
+					f.write(base64.b64decode(coverart))
+	elif ext.lower() == '.jpg':
+		pass
+	else:
+		syslog.syslog('Cannot handle {}'.format(fn))
+		notify('Unknown File Type', 'Cannot handle {}'.format(fn))
+
+	return (artist, album, track, title, genre, img_file)
+		
+def convert(fn, target):
+	(artist, album, track, title, genre, img_file) = getMeta(fn)
+	if title == '':
+		return
+	out_file = '/tmp/{}.m4a'.format(os.path.splitext(os.path.split(fn)[1])[0])
+	
+	#  Retrieve volume adjustment needed for normalization
+	db = 0
+	args = shlex.split('ffmpeg -y -i "{}" -af "volumedetect" -f null /dev/null'.format(fn))
+	process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	results = process.communicate()
+	if process.returncode == 0:
+		for line in results[1].split('\n'):
+			if 'max_volume:' in line:
+				db = float(line.split()[4])
+		if db != 0:
+			db = db * -1 + 0
+	else:
+		notify('Convert Failed', 'ffmpeg volumedetect failed for {}'.format(fn))
+		for line in results[1].split('\n'):
+			syslog.syslog(line)
+			print line
+		return
+		
+	#  Encode audio in AAC and adjust volume
+        args = shlex.split('ffmpeg -y -i "{}" -ar 44100 -b:a 128k -af "volume=volume={}dB" -vn -strict -2 "{}"'.format(fn, db, out_file))
+	process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	results = process.communicate()
+	if not process.returncode == 0:
+		notify('Convert Failed', 'ffmpeg recode failed for {}'.format(fn))
+		for line in results[1].split('\n'):
+			syslog.syslog(line)
+			print line
+		return
+
+	#  Add all metadata to audio file when converting from ogg format
+	(dummy, ext) = os.path.splitext(fn)
+	if ext.lower() == '.ogg':
+		args = shlex.split('AtomicParsley "{}" --overWrite --artist "{}" --album "{}" --tracknum "{}" --title "{}" --genre "{}"'.format(out_file, artist, album, track, title, genre))
+		process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		results = process.communicate()
+		if not process.returncode == 0:
+			notify('Convert Failed', 'AtomicParsley failed adding metadata to {}'.format(fn))
+			for line in results[1].split('\n'):
+				syslog.syslog(line)
+				print line
+			return
+	
+	#  If we have some cover art
+	if not img_file  == '':
+	
+		#  Make sure that the image is in the right format
+		args = shlex.split('convert "{}" -resize 500x500\> "{}.jpg"'.format(img_file, img_file))
+		process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		results = process.communicate()
+		if not process.returncode == 0:
+			notify('Warning', 'Image convert failed for {}'.format(fn))
+			for line in results[1].split('\n'):
+				syslog.syslog(line)
+				print line
+			
+		#  Add the cover art to the audio file
+		args = shlex.split('AtomicParsley "{}" --overWrite --artwork "{}.jpg"'.format(out_file, img_file))
+		process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		results = process.communicate()
+		if not process.returncode == 0:
+			notify('Warning', 'AtomicParsley failed adding cover art to {}'.format(fn))
+			for line in results[1].split('\n'):
+				syslog.syslog(line)
+				print line
+
+		#  Clean up
+		try:
+			os.unlink(img_file)
+			os.unlink('{}.jpg'.format(img_file))
+		except:
+			pass
+			
+	#  Move the audio file to the target location
+	target_path = os.path.split(target)[0]
+	if not os.path.isdir(target_path):
+		try:
+			os.makedirs(target_path)
+		except:
+			notify('Copying File', 'Unable to create the directory {}'.format(target_path))
+			return
+			
+	shutil.copy(out_file, target)
+	os.unlink(out_file)
+
+def main():		
+	parser = OptionParser()
+	(options, args) = parser.parse_args()
+
+	playlist = args[0]
+	usb = args[1]
+	
+	if not os.path.isfile(playlist):
+		notify('Playlist not found', 'Playlist file not found at {}'.format(playlist))
+		sys.exit(1)
+	if not os.path.isdir(usb):
+		notify('USB not found', 'USB device not found at {}'.format(usb))
+		sys.exit(1)
+	
+	with open(playlist, 'r') as f:
+		for fn in f:
+			fn = fn.strip()
+			if not fn.startswith('#'):
+				target = '{}{}.m4a'.format(usb, os.path.splitext(fn)[0].replace('/Music/', '/', 1))
+				fn = fn.replace('/Music/', '/mnt/fileserver/MyLibrary/music/', 1)
+				if not os.path.isfile(target):
+					print('{} -> {}'.format(fn, target))
+					convert(fn, target)
+				else:
+					print('{} already exists'.format(target))
+	
+if __name__ == '__main__':
+	main()
+'''
